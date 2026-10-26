@@ -1,0 +1,21 @@
+[Unit]
+Description=cam4web camera uploader
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cam4web
+SupplementaryGroups=video render
+EnvironmentFile=/etc/cam4web-agent.env
+ExecStart=/usr/bin/python3 /opt/cam4web/agent/cam4web_agent.py
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
