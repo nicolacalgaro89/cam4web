@@ -75,7 +75,24 @@ sudo journalctl -u cam4web-agent -f
 
 Impostare URL HTTPS, token, ID camera e intervallo nell'env. Il file deve essere leggibile da root: systemd passa le variabili al processo. Assicurarsi che script e cartelle in `/opt/cam4web` siano leggibili dall'utente `cam4web`. I gruppi `video` e `render` devono esistere sul sistema. Per applicare modifiche: `sudo systemctl restart cam4web-agent`.
 
-L'agente usa solo la libreria standard Python, acquisisce JPEG 1280×720 di default, non archivia scatti e rimuove il file temporaneo dopo ogni tentativo. In caso di errore riprova con un nuovo scatto, con intervallo crescente fino ad almeno 300 secondi (o l'intervallo configurato, se maggiore). Non recupera gli scatti persi. Camera e permessi hardware restano da verificare sul dispositivo reale.
+L'agente usa solo la libreria standard Python e acquisisce JPEG 1280×720 di default. Prima dell'invio salva su microSD il primo scatto per ogni ora UTC: massimo 24 campioni, con scadenza dopo 24 ore. Se la rete manca, continua ad acquisire all'intervallo configurato; i timeout di acquisizione/invio possono allungare un ciclo. Gli scatti intermedi non vengono conservati.
+
+Quando torna la rete, invia prima la foto corrente e poi fino a quattro campioni arretrati per ciclo, dal più vecchio. Una foto viene rimossa dalla coda solo dopo risposta positiva del server. Se l'invio si interrompe, riprende al ciclo successivo; la coda sopravvive al riavvio del processo o del Raspberry. Un'interruzione tra risposta del server e conferma locale può causare un reinvio; il server conserva comunque un solo campione per ora. I campioni già scaduti vengono eliminati senza invio. Non può recuperare immagini perse prima dell'installazione di questa versione, durante lo spegnimento del Raspberry o in caso di errore della camera.
+
+Con systemd la coda è in `/var/lib/cam4web`, directory creata automaticamente e scrivibile dall'utente del servizio anche con `ProtectSystem=strict`. Avviando lo script manualmente usa `./agent-data`; `CAM4WEB_QUEUE_DIR` permette di cambiare percorso. La coda è separata per URL server e ID camera: cambiandoli, gli arretrati precedenti non vengono inviati alla nuova destinazione. SQLite riutilizza lo spazio liberato; la dimensione del file non si riduce necessariamente dopo l'invio.
+
+Per aggiornare un Raspberry già installato, dopo aver pubblicato il codice su GitHub:
+
+```bash
+sudo systemctl stop cam4web-agent
+sudo git -C /opt/cam4web pull --ff-only
+sudo cp /opt/cam4web/agent/cam4web-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start cam4web-agent
+sudo journalctl -u cam4web-agent -f
+```
+
+Non occorre modificare il token o reinstallare dipendenze. Nei log `Current image uploaded` indica lo scatto corrente e `Hourly image recovered` un campione recuperato dalla coda. Camera e permessi hardware restano da verificare sul dispositivo reale.
 
 ## Contratto API
 
@@ -114,4 +131,4 @@ node --check server/static/app.js
 
 `requirements.lock.txt` registra tutte le versioni usate nella verifica locale (Python 3.10); `requirements.txt` e `requirements-dev.txt` definiscono gli intervalli supportati.
 
-I test verificano token, validazione, limiti, download, isolamento tra camere, scatti concorrenti, campionamento orario, arrivi fuori ordine, scadenza e persistenza alla riapertura. GitHub Actions li esegue su push e pull request.
+I test verificano token, validazione, limiti, download, isolamento tra camere, scatti concorrenti, campionamento orario, arrivi fuori ordine, scadenza e persistenza alla riapertura, coda offline, recupero dopo riavvio e interruzione durante lo smaltimento. GitHub Actions li esegue su push e pull request.

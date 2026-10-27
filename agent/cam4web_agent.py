@@ -2,12 +2,15 @@
 """Raspberry agent: standard library only; camera capture uses rpicam-still."""
 
 import argparse
+import hashlib
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -31,6 +34,76 @@ def upload(url, camera, token, jpeg, captured_at):
     )
     with urlopen(request, timeout=30) as response:
         return response.read()
+
+
+class HourlyQueue:
+    """Keep the first capture per UTC hour, including delivery markers across restarts."""
+
+    def __init__(self, directory, url, camera):
+        scope = hashlib.sha256((url.rstrip("/") + "/" + camera).encode()).hexdigest()[
+            :24
+        ]
+        directory = Path(directory) / scope
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / "queue.sqlite3"
+        with self.connect() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS samples "
+                "(hour INTEGER PRIMARY KEY, captured TEXT NOT NULL, stamp REAL NOT NULL, jpeg BLOB)"
+            )
+
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def prune(self, db, now):
+        db.execute("DELETE FROM samples WHERE stamp<=?", (now - 86400,))
+        db.execute(
+            "DELETE FROM samples WHERE hour NOT IN "
+            "(SELECT hour FROM samples ORDER BY hour DESC LIMIT 24)"
+        )
+
+    def retain(self, jpeg, captured_at):
+        stamp = datetime.fromisoformat(captured_at).timestamp()
+        with self.connect() as db:
+            self.prune(db, stamp)
+            db.execute(
+                "INSERT OR IGNORE INTO samples VALUES (?,?,?,?)",
+                (int(stamp // 3600), captured_at, stamp, jpeg),
+            )
+            self.prune(db, stamp)
+
+    def acknowledge(self, captured_at):
+        with self.connect() as db:
+            # Preserve the marker so later captures in this hour do not refill the queue.
+            db.execute("UPDATE samples SET jpeg=NULL WHERE captured=?", (captured_at,))
+
+    def pending(self, now):
+        with self.connect() as db:
+            self.prune(db, now)
+            return db.execute(
+                "SELECT captured,jpeg FROM samples WHERE jpeg IS NOT NULL "
+                "ORDER BY stamp LIMIT 4"
+            ).fetchall()
+
+
+def deliver(queue, url, camera, token, jpeg, captured_at):
+    # Persist before networking, so a crash or outage cannot lose the hourly sample.
+    queue.retain(jpeg, captured_at)
+    upload(url, camera, token, jpeg, captured_at)
+    queue.acknowledge(captured_at)
+    logger.info("Current image uploaded (%d bytes)", len(jpeg))
+    for timestamp, pending_jpeg in queue.pending(
+        datetime.now(timezone.utc).timestamp()
+    ):
+        upload(url, camera, token, pending_jpeg, timestamp)
+        queue.acknowledge(timestamp)
+        logger.info("Hourly image recovered (%s)", timestamp)
 
 
 def main():
@@ -61,7 +134,7 @@ def main():
     command = shutil.which("rpicam-still") or shutil.which("libcamera-still")
     if not args.image and not command:
         parser.error("Install rpicam-apps-lite or provide --image test.jpg")
-    failures = 0
+    queue = HourlyQueue(os.getenv("CAM4WEB_QUEUE_DIR", "./agent-data"), url, camera)
     while True:
         started = time.monotonic()
         try:
@@ -92,11 +165,8 @@ def main():
                     )
                     jpeg = path.read_bytes()
             captured = datetime.now(timezone.utc).isoformat()
-            upload(url, camera, token, jpeg, captured)
-            failures = 0
-            logger.info("Image uploaded (%d bytes)", len(jpeg))
+            deliver(queue, url, camera, token, jpeg, captured)
         except (OSError, URLError, subprocess.SubprocessError) as error:
-            failures += 1
             # Do not log request headers or token-bearing URLs.
             logger.error(
                 "Capture/upload failed (%s%s)",
@@ -107,8 +177,8 @@ def main():
                 raise SystemExit(1)
         if args.once:
             return
-        delay = max(interval, min(300, 2 ** min(failures, 8))) if failures else interval
-        time.sleep(max(0, delay - (time.monotonic() - started)))
+        # Keep capturing at the configured cadence even when uploads fail.
+        time.sleep(max(0, interval - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":

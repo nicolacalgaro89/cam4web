@@ -7,6 +7,9 @@ After=network-online.target
 Type=simple
 User=cam4web
 SupplementaryGroups=video render
+StateDirectory=cam4web
+StateDirectoryMode=0700
+Environment=CAM4WEB_QUEUE_DIR=/var/lib/cam4web
 EnvironmentFile=/etc/cam4web-agent.env
 ExecStart=/usr/bin/python3 /opt/cam4web/agent/cam4web_agent.py
 Restart=on-failure
